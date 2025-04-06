@@ -12,6 +12,7 @@ import { dropdownTriggerer } from "@/lib/client/utils";
 import MobileNavigation from "./MobileNavigation";
 import ProfileDropdown from "./ProfileDropdown";
 import { useTranslation } from "next-i18next";
+import { useRSSRefresh } from "@/hooks/useRSSRefresh";
 
 export default function Navbar() {
   const { t } = useTranslation();
@@ -21,10 +22,21 @@ export default function Navbar() {
 
   const { width } = useWindowDimensions();
 
+  const { isRefreshing, canRefresh, getTimeUntilNextRefresh, refreshFeeds } = useRSSRefresh();
+  const [timeLeft, setTimeLeft] = useState<number>(0);
+
   useEffect(() => {
     setSidebar(false);
     document.body.style.overflow = "auto";
   }, [width, router]);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setTimeLeft(getTimeUntilNextRefresh());
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [getTimeUntilNextRefresh]);
 
   const toggleSidebar = () => {
     setSidebar(false);
@@ -34,6 +46,12 @@ export default function Navbar() {
   const [newLinkModal, setNewLinkModal] = useState(false);
   const [newCollectionModal, setNewCollectionModal] = useState(false);
   const [uploadFileModal, setUploadFileModal] = useState(false);
+
+  const formatTimeLeft = () => {
+    if (!timeLeft || canRefresh()) return "";
+    const minutes = Math.ceil(timeLeft / 1000 / 60);
+    return `(${minutes}m)`;
+  };
 
   return (
     <div className="flex justify-between gap-2 items-center pl-3 pr-4 py-2 border-solid border-b-neutral-content border-b">
@@ -48,6 +66,15 @@ export default function Navbar() {
       </div>
       <SearchBar />
       <div className="flex items-center gap-2">
+        <div className="tooltip tooltip-bottom" data-tip={canRefresh() ? "Recharger les flux RSS" : `Attendre ${formatTimeLeft()}`}>
+          <button 
+            className={`btn btn-ghost btn-sm btn-square ${isRefreshing ? 'loading' : ''} ${!canRefresh() ? 'btn-disabled' : ''}`}
+            onClick={refreshFeeds}
+            disabled={!canRefresh()}
+          >
+            {!isRefreshing && <i className="bi-rss text-neutral text-xl"></i>}
+          </button>
+        </div>
         <ToggleDarkMode className="hidden sm:inline-grid" />
 
         <div className="dropdown dropdown-end sm:inline-block hidden">

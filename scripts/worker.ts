@@ -4,10 +4,41 @@ import { prisma } from "../lib/api/db";
 import archiveHandler from "../lib/api/archiveHandler";
 import Parser from "rss-parser";
 import { hasPassedLimit } from "../lib/api/verifyCapacity";
+import axios from "axios";
+import https from "https";
 
 const args = process.argv.slice(2).join(" ");
 
 const archiveTakeCount = Number(process.env.ARCHIVE_TAKE_COUNT || "") || 5;
+
+// Configuration HTTPS
+const httpsAgent = new https.Agent({
+  rejectUnauthorized: process.env.IGNORE_UNAUTHORIZED_CA === "true" ? false : true,
+});
+
+// Configurer le parser RSS avec axios
+const parser = new Parser({
+  customFields: {
+    item: ['media:content'],
+  },
+  requestOptions: {
+    agent: httpsAgent
+  }
+});
+
+// Fonction pour récupérer le flux RSS avec axios
+async function fetchRSSContent(url: string) {
+  try {
+    const response = await axios.get(url, {
+      httpsAgent,
+      timeout: 10000 // 10 secondes timeout
+    });
+    return response.data;
+  } catch (error) {
+    console.error("Error fetching RSS feed:", error);
+    throw error;
+  }
+}
 
 type LinksAndCollectionAndOwner = Link & {
   collection: Collection & {
@@ -108,27 +139,65 @@ async function processBatch() {
 }
 
 async function fetchAndProcessRSS() {
+  console.log("\x1b[34m%s\x1b[0m", "Fetching RSS subscriptions...");
   const rssSubscriptions = await prisma.rssSubscription.findMany({});
-  const parser = new Parser();
+  console.log("\x1b[34m%s\x1b[0m", `Found ${rssSubscriptions.length} RSS subscriptions`);
 
-  rssSubscriptions.forEach(async (rssSubscription) => {
-    try {
-      const feed = await parser.parseURL(rssSubscription.url);
-
-      if (
-        rssSubscription.lastBuildDate &&
-        new Date(rssSubscription.lastBuildDate) < new Date(feed.lastBuildDate)
-      ) {
-        console.log(
-          "\x1b[34m%s\x1b[0m",
-          `Processing new RSS feed items for ${rssSubscription.name}`
-        );
-
-        const newItems = feed.items.filter((item) => {
-          const itemPubDate = item.pubDate ? new Date(item.pubDate) : null;
-          return itemPubDate && itemPubDate > rssSubscription.lastBuildDate!; // We know lastBuildDate is not null here
+  await Promise.all(
+    rssSubscriptions.map(async (rssSubscription) => {
+      try {
+        console.log("\x1b[34m%s\x1b[0m", `Fetching feed for ${rssSubscription.name} (${rssSubscription.url})`);
+        
+        // Utiliser axios pour récupérer le contenu RSS
+        const rssContent = await fetchRSSContent(rssSubscription.url);
+        const feed = await parser.parseString(rssContent);
+        
+        // Afficher les dates des 5 premiers articles
+        console.log("\x1b[34m%s\x1b[0m", `Feed ${rssSubscription.name} - Latest articles:`);
+        feed.items.slice(0, 5).forEach((item, index) => {
+          console.log("\x1b[34m%s\x1b[0m", `Article ${index + 1}: ${item.title}`);
+          console.log("\x1b[34m%s\x1b[0m", `- pubDate: ${item.pubDate}`);
+          console.log("\x1b[34m%s\x1b[0m", `- isoDate: ${item.isoDate}`);
         });
 
+        // Vérifier si nous avons déjà des liens de ce flux RSS
+        const existingUrls = await prisma.link.findMany({
+          where: {
+            collection: {
+              id: rssSubscription.collectionId
+            },
+            url: {
+              in: feed.items.map(item => item.link).filter((url): url is string => url !== undefined)
+            }
+          },
+          select: {
+            url: true
+          }
+        });
+
+        let itemsToProcess = feed.items;
+        
+        if (existingUrls.length > 0) {
+          // Si nous avons déjà des articles de ce flux, filtrer par date
+          const lastCheck = new Date(rssSubscription.lastBuildDate || 0);
+          itemsToProcess = feed.items.filter(item => {
+            const itemDate = new Date(item.isoDate || item.pubDate || new Date());
+            const isNewer = itemDate > lastCheck;
+            console.log("\x1b[34m%s\x1b[0m", `Article ${item.title} date comparison: ${itemDate.toISOString()} > ${lastCheck.toISOString()} = ${isNewer}`);
+            return isNewer;
+          });
+        } else {
+          console.log("\x1b[34m%s\x1b[0m", `No existing articles found for feed ${rssSubscription.name}, processing all ${feed.items.length} items without date filtering`);
+          itemsToProcess = feed.items;
+        }
+
+        console.log("\x1b[34m%s\x1b[0m", `Found ${itemsToProcess.length} items to process for ${rssSubscription.name}`);
+
+        if (itemsToProcess.length > 0) {
+          const newItems = itemsToProcess.filter(item => item.link && !existingUrls.map(link => link.url).includes(item.link));
+          console.log("\x1b[34m%s\x1b[0m", `Found ${newItems.length} new items for ${rssSubscription.name}`);
+
+          if (newItems.length > 0) {
         const hasTooManyLinks = await hasPassedLimit(
           rssSubscription.ownerId,
           newItems.length
@@ -142,7 +211,9 @@ async function fetchAndProcessRSS() {
           return;
         }
 
-        newItems.forEach(async (item) => {
+            await Promise.all(
+              newItems.map(async (item) => {
+                console.log("\x1b[34m%s\x1b[0m", `Creating new link for item: ${item.title}`);
           await prisma.link.create({
             data: {
               name: item.title,
@@ -160,13 +231,23 @@ async function fetchAndProcessRSS() {
               },
             },
           });
-        });
+              })
+            );
 
-        // Update the lastBuildDate in the database
+            const mostRecentDate = new Date(Math.max(...newItems.map(item => 
+              new Date(item.isoDate || item.pubDate || new Date()).getTime()
+            )));
+
         await prisma.rssSubscription.update({
           where: { id: rssSubscription.id },
-          data: { lastBuildDate: new Date(feed.lastBuildDate) },
-        });
+              data: { lastBuildDate: mostRecentDate },
+            });
+            console.log("\x1b[34m%s\x1b[0m", `Updated lastBuildDate for ${rssSubscription.name} to ${mostRecentDate.toISOString()}`);
+          } else {
+            console.log("\x1b[34m%s\x1b[0m", `No new items to add for ${rssSubscription.name}`);
+          }
+        } else {
+          console.log("\x1b[34m%s\x1b[0m", `No items to process for ${rssSubscription.name}`);
       }
     } catch (error) {
       console.error(
@@ -175,7 +256,8 @@ async function fetchAndProcessRSS() {
         error
       );
     }
-  });
+    })
+  );
 }
 
 function delay(sec: number) {
